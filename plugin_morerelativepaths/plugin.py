@@ -1,0 +1,129 @@
+import os
+import re
+import logging
+from pathlib import Path
+from mkdocs.plugins import BasePlugin
+
+log = logging.getLogger("mkdocs.plugins.MoreRelativePathsPlugin")
+log.setLevel(logging.INFO)
+
+
+class MoreRelativePathsPlugin(BasePlugin):
+    """
+    Early-stage plugin that intelligently rewrites file paths in markdown.
+
+    Handles common Material for MkDocs patterns:
+    - For index.md: checks sibling subfolder with parent directory name and rewrites paths
+    - For page.md: checks sibling subfolder named "page" but does NOT rewrite paths
+      (because MkDocs outputs page.md as page/index.html, so relative paths already work)
+    - Works for all file references (images, videos, 3D models, text files, etc.)
+
+    This allows subsequent plugins to assume standard relative paths.
+    """
+
+    def on_page_markdown(self, markdown, page, config, files):
+        """Rewrite paths in markdown before other plugins process them"""
+        src_path = page.file.src_path
+        parent_dir = os.path.dirname(src_path)
+
+        if not parent_dir:
+            return markdown
+
+        docs_dir = Path(config['docs_dir'])
+        current_abs_dir = docs_dir / parent_dir
+        page_stem = Path(page.file.name).stem
+        parent_dir_name = os.path.basename(parent_dir)
+
+        # Determine which subfolder to check
+        # For index.md, use parent directory name
+        # For other pages, use page stem
+        is_index_page = (page_stem == 'index')
+        subfolder_name = parent_dir_name if is_index_page else page_stem
+
+        if not subfolder_name or not current_abs_dir.exists():
+            return markdown
+
+        # Find the actual subfolder (case-insensitive)
+        actual_subfolder = None
+        try:
+            for item in os.listdir(current_abs_dir):
+                item_path = current_abs_dir / item
+                if item_path.is_dir() and item.lower() == subfolder_name.lower():
+                    actual_subfolder = item
+                    break
+        except (OSError, PermissionError):
+            return markdown
+
+        if not actual_subfolder:
+            return markdown
+
+        def rewrite_path(original_path):
+            """Check if path should be rewritten to include subfolder"""
+            # Skip external URLs and absolute paths
+            if original_path.startswith(('http://', 'https://', '//', '/')):
+                return original_path
+
+            # Skip if path already starts with the subfolder name
+            first_component = original_path.split('/')[0].split('\\')[0]
+            if first_component.lower() == actual_subfolder.lower():
+                return original_path
+
+            # Check if resource exists in the subfolder
+            potential_resource = current_abs_dir / actual_subfolder / original_path
+            if potential_resource.exists():
+                # For index.md: rewrite path to include subfolder
+                # For page.md: do NOT rewrite - MkDocs outputs to page/index.html
+                #              so relative paths from there already reach the subfolder
+                if is_index_page:
+                    new_path = f"{actual_subfolder}/{original_path}"
+                    log.debug(f"Rewriting '{original_path}' -> '{new_path}' in {src_path}")
+                    return new_path
+                else:
+                    # Non-index page: MkDocs will output to subfolder/index.html
+                    # so the relative path works as-is
+                    log.debug(f"Path '{original_path}' found in subfolder, no rewrite needed for non-index page {src_path}")
+                    return original_path
+
+            return original_path
+
+        # Rewrite markdown image syntax: ![alt](path)
+        def replace_markdown_image(match):
+            prefix = match.group(1)
+            alt_text = match.group(2)
+            original_path = match.group(3)
+            attributes = match.group(4) or ''
+
+            # Strip surrounding quotes from the path if present
+            clean_path = original_path.strip().strip('"\'')
+            new_path = rewrite_path(clean_path)
+
+            # Preserve original quoting style if it was quoted
+            if original_path.startswith('"') or original_path.startswith("'"):
+                quote_char = original_path[0]
+                new_path = f'{quote_char}{new_path}{quote_char}'
+
+            return f"{prefix}[{alt_text}]({new_path}){attributes}"
+
+        # Rewrite HTML src/href attributes
+        def replace_html_attribute(match):
+            tag_start = match.group(1)
+            attr_name = match.group(2)
+            quote = match.group(3)
+            original_path = match.group(4)
+            tag_end = match.group(5)
+
+            new_path = rewrite_path(original_path)
+            return f"{tag_start}{attr_name}={quote}{new_path}{quote}{tag_end}"
+
+        # Apply markdown rewriting (handles !, !!, !#, etc. prefixes)
+        image_pattern = re.compile(r'(!+#?)\[([^\]]*)\]\(([^)]+)\)(\{[^}]*\})?')
+        markdown = image_pattern.sub(replace_markdown_image, markdown)
+
+        # Apply HTML rewriting
+        html_pattern = re.compile(
+            r'(<[^>]*?\s)(src|href)=(["\'])([^"\']+)\3([^>]*?>)',
+            re.IGNORECASE
+        )
+        markdown = html_pattern.sub(replace_html_attribute, markdown)
+
+        return markdown

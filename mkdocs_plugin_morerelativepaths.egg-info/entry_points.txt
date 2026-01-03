@@ -1,0 +1,2 @@
+[mkdocs.plugins]
+morerelativepaths = plugin_morerelativepaths.plugin:MoreRelativePathsPlugin
